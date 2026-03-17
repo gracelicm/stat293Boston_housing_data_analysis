@@ -1,0 +1,225 @@
+---
+title: "STAT 293 Final Project"
+author: "Chuanman Li, Pei-Ling Lin and Xinhao Qu"
+date: "2026-03-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+library(mice)
+library(spdep)
+library(spatialreg)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(naniar)
+```
+
+
+```{r}
+load("housing.rdata")
+dat <- housing_data
+```
+
+```{r}
+# =========================================================
+# Missing Data Summary
+# =========================================================
+# install.packages("naniar")
+
+miss_var_summary(dat)
+```
+
+```{r}
+# =========================================================
+# Plot Missing Data by Locations
+# =========================================================
+vars_to_check <- c("cmedv", "crim", "zn", "indus", "chas", "nox",
+                   "rm", "age", "dis", "rad", "ptratio", "lstat")
+
+missing_long <- dat %>%
+  select(lon, lat, all_of(vars_to_check)) %>%
+  mutate(across(all_of(vars_to_check), ~ is.na(.))) %>%
+  pivot_longer(
+    cols = all_of(vars_to_check),
+    names_to = "variable",
+    values_to = "is_missing"
+  )
+
+ggplot(missing_long, aes(x = lon, y = lat)) +
+  geom_point(color = "grey85", size = 1) +
+  geom_point(
+    data = subset(missing_long, is_missing),
+    color = "red",
+    size = 1,
+    alpha = 0.8
+  ) +
+  facet_wrap(~ variable) +
+  labs(
+    title = "Missing value locations by variable",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# =========================================================
+# 1. Setup imputation
+# =========================================================
+init <- mice(dat, maxit = 0)
+meth <- init$method
+pred <- init$predictorMatrix
+
+# variable-specific imputation methods
+meth["chas"]  <- "logreg"   # binary
+meth["rad"]   <- "polyreg"  # categorical/discrete
+meth["cmedv"] <- "pmm"      # continuous target
+
+# remove ID-like variables and medv
+pred[, c("town", "tract", "medv")] <- 0
+
+# run MI
+imputed_data_set <- mice(
+  dat,
+  m = 20,
+  method = meth,
+  predictorMatrix = pred,
+  maxit = 10,
+  seed = 123
+)
+
+# =========================================================
+# 2. SAR model
+# =========================================================
+
+# for W matrix
+# Extract coordinates
+coords <- cbind(dat$lon, dat$lat)
+
+# Define neighbors (using a distance threshold or k-nearest)
+ids <- knearneigh(coords, k = 5) # 5 nearest neighbors
+nb <- knn2nb(ids)
+
+# Calculate distances for those neighbors
+dist_list <- nbdists(nb, coords)
+
+# Apply Inverse Distance function: w = 1/d
+inv_dist_list <- lapply(dist_list, function(x) 1/x)
+
+# Convert to a listw object (style="W" performs Row Normalization)
+# Row normalization ensures the sum of weights for each row equals 1
+listw <- nb2listw(nb, glist = inv_dist_list, style = "W")
+
+fit_sar_model <- function(data) {
+  lagsarlm(
+    cmedv ~ crim + zn + indus + chas + nox + rm + age +
+      dis + rad + tax + ptratio + b + lstat,
+    data = data,
+    listw = listw
+  )
+}
+
+# =========================================================
+# 3. Rubin pooling for vector parameters
+#    This pools all coefficients jointly, including rho
+# =========================================================
+pool_vector_rubin <- function(est_mat, var_mat_list) {
+  m <- ncol(est_mat)
+  p <- nrow(est_mat)
+  
+  qbar <- rowMeans(est_mat)
+  
+  # average within-imputation covariance
+  ubar <- Reduce(`+`, var_mat_list) / m
+  
+  # between-imputation covariance
+  b <- matrix(0, p, p)
+  for (i in 1:m) {
+    d <- est_mat[, i] - qbar
+    b <- b + tcrossprod(d)
+  }
+  b <- b / (m - 1)
+  
+  # total covariance
+  tmat <- ubar + (1 + 1 / m) * b
+  se <- sqrt(diag(tmat))
+  
+  out <- data.frame(
+    term = rownames(est_mat),
+    estimate = qbar,
+    std.error = se,
+    row.names = NULL
+  )
+  out
+}
+
+# =========================================================
+# 4. Primary MAR analysis
+# =========================================================
+sar_analyses_mar <- lapply(1:imputed_data_set$m, function(i) {
+  single_set <- complete(imputed_data_set, i)
+  fit_sar_model(single_set)
+})
+
+beta_mat_mar  <- sapply(sar_analyses_mar, coef)
+vcov_list_mar <- lapply(sar_analyses_mar, vcov)
+
+pooled_beta_mar <- pool_vector_rubin(beta_mat_mar, vcov_list_mar)
+
+cat("\n--- Primary MAR pooled results ---\n")
+print(pooled_beta_mar)
+
+cat("\n--- Pooled rho under MAR ---\n")
+print(subset(pooled_beta_mar, term == "rho"))
+
+# =========================================================
+# 5. Sensitivity analysis: delta-adjusted pattern-mixture
+#    Shift only originally missing cmedv values
+# =========================================================
+miss_cmedv <- is.na(dat$cmedv)
+
+apply_delta_cmedv <- function(data_completed, miss_index, delta) {
+  data_new <- data_completed
+  data_new$cmedv[miss_index] <- data_new$cmedv[miss_index] + delta
+  data_new
+}
+
+# choose delta values using SD of observed cmedv
+sd_cmedv <- sd(dat$cmedv, na.rm = TRUE)
+deltas <- c(-0.3, -0.1, 0, 0.1, 0.3) * sd_cmedv
+
+sens_results_beta <- vector("list", length(deltas))
+names(sens_results_beta) <- as.character(deltas)
+
+for (dd in deltas) {
+  sar_analyses_delta <- lapply(1:imputed_data_set$m, function(i) {
+    single_set <- complete(imputed_data_set, i)
+    single_set_delta <- apply_delta_cmedv(single_set, miss_cmedv, dd)
+    fit_sar_model(single_set_delta)
+  })
+  
+  beta_mat_delta  <- sapply(sar_analyses_delta, coef)
+  vcov_list_delta <- lapply(sar_analyses_delta, vcov)
+  
+  pooled_beta_delta <- pool_vector_rubin(beta_mat_delta, vcov_list_delta)
+  pooled_beta_delta$delta <- dd
+  
+  sens_results_beta[[as.character(dd)]] <- pooled_beta_delta
+}
+
+sens_beta_tab <- rbindlist(sens_results_beta, fill = TRUE)
+
+cat("\n--- Sensitivity analysis pooled results ---\n")
+print(sens_beta_tab)
+
+cat("\n--- Sensitivity analysis: rho only ---\n")
+print(subset(sens_beta_tab, term == "rho"))
+```
+
