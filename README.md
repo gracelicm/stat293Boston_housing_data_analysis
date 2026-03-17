@@ -5,7 +5,7 @@ edacode.R is the R code for exploratory data analysis.
 
 293final.Rmd is the R code for multiple imputation for missing data.
 
-Moran_test.R is the R code for Spatial visualization, Moran’s I statistic, and SAR model.
+Moran_test.R is the R code for Spatial visualization and Moran’s I statistic.
 
 housing.rdata is the dataset used in this project.
 
