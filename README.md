@@ -3,7 +3,9 @@ This is the GitHub repository created for the project analyzes Boston housing da
 
 edacode.R is the R code for exploratory data analysis.
 
-293final.Rmd is the R code for multiple imputation for missing data.
+data_analysis.Rmd is the R code for multiple imputation of missing data, fitting the Spatial Autoregressive (SAR) model, and conducting sensitivity analysis.
+
+data_analysis.pdf is the output generated from data_analysis.Rmd.
 
 Moran_test.R is the R code for Spatial visualization and Moran’s I statistic.
 
